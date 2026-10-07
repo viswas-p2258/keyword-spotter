@@ -132,5 +132,6 @@ dmypy.json
 # Local experiment tracking and generated output
 artifacts/mlruns/
 artifacts/tmp_upload.wav
+mlruns/
 outputs/
 models/
