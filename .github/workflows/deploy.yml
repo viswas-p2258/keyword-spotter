@@ -1,0 +1,140 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: keyword-spotting-app
+  IMAGE_TAG: ${{ github.sha }}
+  EC2_HOST: ${{ secrets.EC2_HOST }}
+  EC2_USER: ${{ vars.EC2_USER || 'ubuntu' }}
+
+jobs:
+  build-test-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate deployment configuration
+        env:
+          AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          EC2_SSH_KNOWN_HOSTS: ${{ secrets.EC2_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          for name in AWS_ROLE_TO_ASSUME EC2_HOST EC2_SSH_PRIVATE_KEY EC2_SSH_KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Required GitHub secret is missing: ${name}"
+              exit 1
+            fi
+          done
+          if [[ "$EC2_HOST" == REPLACE_* ]]; then
+            echo "::error::EC2_HOST is still a placeholder."
+            exit 1
+          fi
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Configure AWS credentials using GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      - name: Ensure ECR repository exists
+        run: |
+          if ! aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1; then
+            aws ecr create-repository \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256
+          fi
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" \
+            --tag "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest" \
+            .
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          docker push "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+
+      - name: Deploy to EC2 and verify health
+        env:
+          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          EC2_SSH_KNOWN_HOSTS: ${{ secrets.EC2_SSH_KNOWN_HOSTS }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          for name in EC2_HOST EC2_USER EC2_SSH_PRIVATE_KEY EC2_SSH_KNOWN_HOSTS ECR_REGISTRY; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Required GitHub secret or variable is missing: ${name}"
+              exit 1
+            fi
+          done
+          if [[ "$EC2_HOST" == REPLACE_* ]]; then
+            echo "::error::EC2_HOST is still a placeholder."
+            exit 1
+          fi
+
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+          printf '%s\n' "$EC2_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          image="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -i ~/.ssh/ec2_key "${EC2_USER}@${EC2_HOST}" \
+            "aws ecr get-login-password --region '${AWS_REGION}' | docker login --username AWS --password-stdin '${ECR_REGISTRY}' &&
+             docker pull '${image}' &&
+             (docker rm --force kws-app >/dev/null 2>&1 || true) &&
+             docker run --detach --name kws-app --restart unless-stopped --publish 80:5000 '${image}' &&
+             for attempt in \$(seq 1 30); do
+               if curl --fail --silent http://127.0.0.1/health; then exit 0; fi
+               sleep 2
+             done
+             docker logs kws-app
+             exit 1"
+
+      - name: Verify public health endpoint
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error "http://${EC2_HOST}/health"; then
+              echo
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Deployed application's public /health endpoint did not return HTTP 2xx."
+          exit 1

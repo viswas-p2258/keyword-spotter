@@ -1,0 +1,53 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        run: pytest -q
+
+      - name: Build Docker image
+        run: docker build --tag kws-spotter:test .
+
+      - name: Start Docker container
+        run: docker run --detach --name kws-spotter-test --publish 5000:5000 kws-spotter:test
+
+      - name: Verify Docker health endpoint
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:5000/health; then
+              echo
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs kws-spotter-test
+          exit 1
+
+      - name: Stop Docker container
+        if: always()
+        run: docker rm --force kws-spotter-test || true

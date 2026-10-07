@@ -1,0 +1,22 @@
+params:
+  epochs: 100
+  learning_rate: 0.001
+  test_data_split_percent: 0.25
+  mfcc_length: 40
+  sampling_rate: 16000
+  n_mfcc: 49
+  batch_size: 64
+
+paths:
+  train_dir: dataset/train
+  test_dir: dataset/test
+  mlflow_tracking_uri: artifacts/mlruns
+  model_artifactory_dir: artifacts/model
+  audio_dir: dataset/test
+  models_dir: models
+  outputs_dir: outputs
+
+names:
+  experiment_name: ASR_Exp
+  audio_file: dataset/test/audio1.wav
+  metric_name: val_accuracy
