@@ -45,6 +45,14 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
 
+      - name: Verify assumed AWS identity
+        run: |
+          account_id=$(aws sts get-caller-identity --query Account --output text)
+          if [[ "$account_id" != "696073197777" ]]; then
+            echo "::error::GitHub OIDC assumed an unexpected AWS account: ${account_id}."
+            exit 1
+          fi
+
       - name: Ensure ECR repository exists
         run: |
           if ! aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1; then
